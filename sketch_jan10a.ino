@@ -57,3 +57,8 @@ void loop() {
     0,
     (uint8_t*)payload.c_str(),
     payload.length()
+  );
+
+  coap.loop();
+  delay(1000); // gửi mỗi 1s
+}
