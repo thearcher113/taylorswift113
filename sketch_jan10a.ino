@@ -17,7 +17,7 @@ const char* password = "LongLong";
 // ====== SERVER ======
 const char* server_ip = "192.168.137.1";
 const int server_port = 5683;
-const char* resource_path = "api/records/upload";
+const char* resource_path = "/api/records/upload";
 
 Adafruit_MPU6050 mpu;
 WiFiUDP udp;
