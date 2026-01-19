@@ -111,7 +111,7 @@ void loop() {
     NULL,
     0,
     (const uint8_t*)payload.c_str(),
-    payload.length()
+    payload.length(), COAP_APPLICATION_JSON
   );
 
   coap.loop();
