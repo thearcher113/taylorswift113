@@ -5,6 +5,7 @@
 #include <WiFiUdp.h>
 #include <coap-simple.h>
 #include <LiquidCrystal_I2C.h>
+#include <time.h>
 
 // ====== CẤU HÌNH PIN LED ======
 const int LED_DONG_DAT = 4;
@@ -23,24 +24,47 @@ const char* resource_path = "api/records/upload";
 Adafruit_MPU6050 mpu;
 WiFiUDP udp;
 Coap coap(udp);
-unsigned long msg_id = 0; 
 
-// 2. Khởi tạo LCD (Địa chỉ 0x27, 16x2)
-// SDA nối chân 21, SCL nối chân 22 trên ESP32
+// Biến bổ sung cho điều kiện thực tế (để tính toán không bị kẹt)
+float lastTotalAcc = 9.81; 
+float base_roll = 0, base_pitch = 0;
+int stability_count = 0;
+
+// LCD
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
+// ====== HÀM TẠO TIMESTAMP ======
+String getTimestampFast() {
+  time_t now = time(NULL);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  char buf[20];
+  sprintf(buf, "%02d%02d%04d%02d%02d%02d",
+          t.tm_mday,
+          t.tm_mon + 1,
+          t.tm_year + 1900,
+          t.tm_hour,
+          t.tm_min,
+          t.tm_sec);
+
+  return String(buf);
+}
+
+// Callback CoAP
 void callback_response(CoapPacket &packet, IPAddress ip, int port) {
   Serial.println(">>> Server phản hồi OK");
 }
 
 void setup() {
   Serial.begin(115200);
-  // === Cấu hình chân LED ===
+
+  // LED
   pinMode(LED_DONG_DAT, OUTPUT);
   pinMode(LED_SAT_LO, OUTPUT);
   pinMode(2, OUTPUT);
 
-  // 3. Khởi tạo LCD và I2C
+  // LCD
   Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
@@ -65,6 +89,16 @@ void setup() {
   lcd.print("WiFi: OK       ");
   delay(1000);
 
+  // ====== ĐỒNG BỘ THỜI GIAN NTP (NON-BLOCKING) ======
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  unsigned long startSync = millis();
+  while (time(NULL) < 1000000000 && millis() - startSync < 5000) {
+    delay(100);
+  }
+
+  Serial.println("Thoi gian NTP: " + getTimestampFast());
+
   // ====== KHỞI ĐỘNG MPU6050 ======
   if (!mpu.begin()) {
     Serial.println("!!! Không tìm thấy MPU6050");
@@ -78,10 +112,17 @@ void setup() {
 
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_10_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); // Lọc nhiễu tần số cao
+
+  // Lấy mốc cân bằng ban đầu (Calibration)
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  base_roll = atan2(a.acceleration.y, a.acceleration.z) * 57.3;
+  base_pitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 57.3;
 
   coap.response(callback_response);
   coap.start();
+
   lcd.clear();
 }
 
@@ -89,94 +130,102 @@ void loop() {
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
 
-  // --- QUẢN LÝ ID 4 CHỮ SỐ (0000 - 9999) ---
-  char id_str[5];
-  sprintf(id_str, "%04d", msg_id); 
-
-  // Lưu lại ID hiện tại để dùng cho gói tin
-  String current_id = String(id_str);
-
-  msg_id++;
-  if (msg_id > 9999) msg_id = 0; 
-  
-  // --- TÍNH TOÁN CẤP ĐỘ THỰC TẾ ---
+  // Dữ liệu sensor
   float ax = accel.acceleration.x;
   float ay = accel.acceleration.y;
   float az = accel.acceleration.z;
+
+  // --- THUẬT TOÁN ĐỘNG ĐẤT (VIBRATION) ---
   float totalAcc = sqrt(ax*ax + ay*ay + az*az);
-  float diff = abs(totalAcc - 9.81);
+  float vibration = abs(totalAcc - lastTotalAcc);
+  lastTotalAcc = totalAcc; 
 
   int n = 0;
   String dong_dat = "none";
 
-  if (diff > 1) {
+  if (vibration > 0.1) { 
     dong_dat = "co_dong_dat";
-    if (diff < 2.5) n = 1;
-    else if (diff < 4.5) n = 2;
-    else if (diff < 7.0) n = 3;
-    else if (diff < 10.0) n = 4;
-    else if (diff < 15.0) n = 5;
-    else if (diff < 22.0) n = 6;
-    else if (diff < 33.0) n = 7;
-    else if (diff < 40.0) n = 8;
+    if (vibration < 0.5) n = 1;
+    else if (vibration < 1) n = 2;
+    else if (vibration < 1.5) n = 3;
+    else if (vibration < 3.0) n = 4;
+    else if (vibration < 5.0) n = 5;
+    else if (vibration < 7.0) n = 6;
+    else if (vibration < 12.0) n = 7;
+    else if (vibration < 15.0) n = 8;
     else n = 9;
   }
 
-  String sat_lo = (abs(az) < 8.5 || abs(ax) > 4.0 || abs(ay) > 4.0) ? "1" : "none";
+  // --- THUẬT TOÁN SẠT LỞ (TILT) ---
+  float current_roll = atan2(ay, az) * 57.3;
+  float current_pitch = atan2(-ax, sqrt(ay*ay + az*az)) * 57.3;
 
-  // ====== HIỂN THỊ LÊN LCD ======
+  float diff_roll = abs(current_roll - base_roll);
+  float diff_pitch = abs(current_pitch - base_pitch);
+
+  String sat_lo = "none";
+  // Ngưỡng nghiêng 15 độ so với mốc cân bằng
+  if (diff_roll > 15.0 || diff_pitch > 15.0) {
+    sat_lo = "1";
+    
+    // Thoát kẹt: Nếu nghiêng rồi nhưng nằm yên (vibration thấp) thì sau 5s cập nhật base mới
+    if (vibration < 0.1) {
+      stability_count++;
+      if (stability_count > 5) { 
+        base_roll = current_roll;
+        base_pitch = current_pitch;
+        stability_count = 0;
+      }
+    } else {
+      stability_count = 0; 
+    }
+  } else {
+    stability_count = 0;
+  }
+
+  // LCD hiển thị
   lcd.setCursor(0, 0);
   if (n > 0) {
     lcd.print("DONG DAT: CAP ");
     lcd.print(n);
+    lcd.print(" ");
   } else {
     lcd.print("DONG DAT: KHONG ");
   }
 
   lcd.setCursor(0, 1);
   if (sat_lo == "1") {
-    lcd.print("CO SAT LO!    ");
+    lcd.print("CO SAT LO!      ");
   } else {
-    lcd.print("SAT LO: KHONG     ");
-
-    lcd.print(current_id);
+    lcd.print("SAT LO: KHONG   ");
   }
 
-  // ====== ĐIỀU KHIỂN LED NHÁY ======
-  // Nháy LED Động đất (Chân 4)
-  if (n > 0) {
-    digitalWrite(LED_DONG_DAT, HIGH);
-  } else {
-    digitalWrite(LED_DONG_DAT, LOW);
-  }
+  digitalWrite(LED_DONG_DAT, n > 0);
+  digitalWrite(LED_SAT_LO, sat_lo == "1");
 
-  // Nháy LED Sạt lở (Chân 16)
-  if (sat_lo == "1") {
-    digitalWrite(LED_SAT_LO, HIGH);
-  } else {
-    digitalWrite(LED_SAT_LO, LOW);
-  }
+  // ====== LẤY TIMESTAMP NHANH ======
+  String ts = getTimestampFast();
+  Serial.println("Timestamp: " + ts);
 
-  // ====== GỬI GÓI TIN (SERIAL + COAP) ======
-  String payload1 = "{\"t\":1,\"id\":\"" + current_id + "\",\"dong_dat\":\"" + dong_dat + "\",\"cap_do\":" + String(n) + ",\"sat_lo\":\"" + sat_lo + "\"}";
-  String payload2 = "{\"t\":2,\"id\":\"" + current_id + "\",\"ax\":" + String(ax, 2) + ",\"ay\":" + String(ay, 2) + ",\"az\":" + String(az, 2) + 
-                    ",\"gx\":" + String(gyro.gyro.x, 2) + ",\"gy\":" + String(gyro.gyro.y, 2) + ",\"gz\":" + String(gyro.gyro.z, 2) + "}";
+  // ====== PAYLOAD ======
+String payload = "{";
+payload += "\"id\":\"ESP32-01\","; // Trường 'id' bắt buộc
+payload += "\"ts\":" + String(ts) + ",";  
+payload += "\"ax\":" + String(ax, 2) + ",";  // Trường 'ax' bắt buộc
+payload += "\"ay\":" + String(ay, 2) + ",";  // Trường 'ay' bắt buộc
+payload += "\"az\":" + String(az, 2) + ",";  // Trường 'az' bắt buộc
+payload += "\"gx\":" + String(gyro.gyro.x, 2) + ","; // Trường 'gx' bắt buộc
+payload += "\"gy\":" + String(gyro.gyro.y, 2) + ","; // Trường 'gy' bắt buộc
+payload += "\"gz\":" + String(gyro.gyro.z, 2);       // Trường 'gz' bắt buộc.
+payload += "}";
 
   IPAddress ipAddr;
   ipAddr.fromString(server_ip);
 
-  // In Serial Monitor
-  Serial.println("Gói 1: " + payload1);
-  coap.send(ipAddr, server_port, resource_path, COAP_CON, COAP_POST, NULL, 0, (const uint8_t*)payload1.c_str(), payload1.length());
-  
-  delay(150); 
-
-  Serial.println("Gói 2: " + payload2);
-  coap.send(ipAddr, server_port, resource_path, COAP_CON, COAP_POST, NULL, 0, (const uint8_t*)payload2.c_str(), payload2.length());
+  Serial.println("Đã gửi: " + payload);
+  coap.send(ipAddr, server_port, resource_path, COAP_CON, COAP_POST, NULL, 0,
+            (const uint8_t*)payload.c_str(), payload.length());
 
   coap.loop();
-  delay(500); 
-  digitalWrite(LED_DONG_DAT, LOW);
-  digitalWrite(LED_SAT_LO, LOW);
-  delay(500);
+  delay(250);
 }
